@@ -12,6 +12,98 @@ library(readr)
 library(lme4)
 library(meta)
 
+
+
+#Functions:
+spread_factor_columns <- function(df) {
+  variables <- colnames(df)
+  # For all columns, check if it is a factor,
+  # if so, spread levels across columns as 0/1.
+  # else, copy the column as is.
+  out <- do.call("cbind", lapply(variables, function(variable) {
+    col <- df[,variable]
+    if (is.factor(col)) {
+      # For all levels, add a numeric column (0/1) indicating the
+      # factor value for the row.
+      uniqueLevels <- levels(col)
+      colDf <- as.data.frame(lapply(uniqueLevels, function(factorLevel) {
+        levelBool <- as.numeric(col == factorLevel)
+      }))
+      colnames(colDf) <- paste0(variable, uniqueLevels)
+      return(colDf)
+    } else {
+      colDf <- data.frame(col)
+      colnames(colDf) <- variable
+      return(colDf)
+    }
+  }))
+  return(out)
+}
+# Function to predict outcome values given a new dataset, 
+# named coefficient list (from a meta-analysis),
+# the model on which analysis is based
+predict_meta <- function(df, coefficients, formula, family) {
+  # Extract the terms from the base model
+  metaTerms <- terms(formula)
+  # Get the variables that must be present
+  variables <- unlist(as.list(attributes(metaTerms)$variables))
+  # Check if all these variables are present (excluding 'list' and the response variable)
+  if (!all(variables[3:length(variables)] %in% colnames(df))) {
+    stop("required variables are not present in the data")
+  }
+  # Get a subset of stuff
+  dfSubset <- df[,as.character(variables[3:length(variables)])]
+  # Spread all factor levels across columns for all columns that are factors.
+  dfSpread <- spread_factor_columns(dfSubset)
+  # Calculate the predicted values per term
+  predictionPerTerm <- do.call("cbind", sapply(
+    names(coefficients), 
+    function(coefficientLabel) {
+      # Coefficient
+      coefficient <- coefficients[coefficientLabel]
+      # Parse coefficient label,
+      # Find out which columns should be multiplied
+      variablesToMultiply <- strsplit(coefficientLabel, ":", fixed = T)[[1]]
+      if (all(variablesToMultiply == "(Intercept)")) {
+        return(data.frame(coefficientLabel = rep(coefficient, nrow(dfSpread))))
+      } else if (length(variablesToMultiply) == 2) {
+        return(Reduce(`*`, dfSpread[variablesToMultiply]) * coefficient)
+      } else if (length(variablesToMultiply == 1)) {
+        return(dfSpread[variablesToMultiply] * coefficient)
+      } else {
+        stop("Something went wrong, or we are going to multiply more than two terms. Check if this works first!")
+      }
+    }))
+  # Calculate the predicted values on a regular linear scale
+  predicted <- rowSums(predictionPerTerm)
+  # Return values according to the linear inverse of the link function
+  return(family$linkinv(predicted))
+}
+
+
+inverseVarianceMeta <- function(resultsPerArray, seCol, valueCol){
+  x <- as.data.frame(resultsPerArray[[1]][,FALSE])
+  x$sumYDivSe2 <- 0
+  x$sum1DivSe2 <- 0
+  
+  for(array in names(resultsPerArray)){
+    se2 <- resultsPerArray[[array]][,seCol] * resultsPerArray[[array]][,seCol]
+    x$sumYDivSe2 <- x$sumYDivSe2 + (resultsPerArray[[array]][,valueCol]/ se2)
+    x$sum1DivSe2 <- x$sum1DivSe2 + (1/se2)
+  }
+  
+  metaRes <- as.data.frame(resultsPerArray[[1]][,FALSE])
+  metaRes$y <- x$sumYDivSe2/x$sum1DivSe2
+  metaRes$se <- sqrt(1/x$sum1DivSe2)
+  metaRes$z <- metaRes$y/metaRes$se 
+  metaRes$p <- 2*pnorm(-abs(metaRes$z))
+  return(metaRes)
+}
+
+
+
+
+
 if(FALSE){
   #Run once to conver pheno data to RDS format
   pheno <- read_delim("/groups/umcg-lifelines/tmp01/projects/ov20_0554/analysis/risky_behaviour/PRS_correlation/questtionnaire_data_subset_genome_filter_correct_filled_questionnaires/covid_export_questionnaire_1-17_questionnaire_filter_genome_correct_filled_18-03-2021.txt", delim = "\t", quote = "", guess_max = 100000)
@@ -51,6 +143,11 @@ if(!all(!row.names(prsGsa$PROJECT_PSEUDO_ID) %in% row.names(prsCyto$PROJECT_PSEU
   stop("Overlapping samples")
 }
 
+#Scale to zero per array
+prsGsa[,-1] <- scale(prsGsa[,-1])
+prsCyto[,-1] <- scale(prsCyto[,-1])
+
+
 prs <- rbind(prsGsa, prsCyto)
 
 selectedTraits <- read.delim("/groups/umcg-lifelines/tmp01/projects/ov20_0554/analysis/pgs_correlations/selectedTraits.txt", header = F, stringsAsFactors = F, comment.char = "#")[,1]
@@ -63,6 +160,8 @@ colnames(prs)[colnames(prs) == "BMI"] <- "BMI_gwas"
 if(!all(pheno2$PROJECT_PSEUDO_ID %in% prs$PROJECT_PSEUDO_ID)){
   stop("Not all pheno have genetics")#easly solved but code makes this assumtion
 }
+
+
 
 pheno2$array <- factor(as.numeric(pheno2$PROJECT_PSEUDO_ID %in% prsGsa$PROJECT_PSEUDO_ID), levels = 0:1, labels = c("Cyto", "Gsa"))
 
@@ -94,7 +193,7 @@ vls <- colnames(qOverview)[-c(20,21)]
 
 
 
-# mask questions with >75% missing
+
 qOverview[,-c(20,21)] <- apply(qOverview[,-c(20,21)], 1:2, function(x){
   if(x==""){
     return ("")
@@ -104,11 +203,13 @@ qOverview[,-c(20,21)] <- apply(qOverview[,-c(20,21)], 1:2, function(x){
     #always include data question
     return(x)
   } else {
-    if(sum(is.na(pheno3[,x])) >= (totalPart/4)){
-      return (x)
-    } else {
-      return ("")
-    }
+    return(x)#no masking
+    # mask questions with >75% missing
+    #if(sum(is.na(pheno3[,x])) >= (totalPart/4)){
+    #  return (x)
+    #} else {
+      #return ("")
+    #}
   }
 })
 
@@ -191,13 +292,25 @@ vragenLong$chronic_recent <- factor(vragenLong$chronic_recent, levels = 0:1, lab
 hist(vragenLong$days, breaks = 330)
 dev.off()
 
-str(vragenLong)
 
+## Add oxfor goverment repsonse index
+
+gri <- read.delim("/groups/umcg-lifelines/tmp01/projects/ov20_0554/analysis/risky_behaviour/jobs/OxCGRT/OxCGRT_Netherlands.txt", stringsAsFactors = F)
+row.names(gri) <- gri$Date
+
+vragenLong$GovernmentResponseIndex <- gri[as.character(vragenLong[,qNameMap["responsdatum covid-vragenlijst",2]]),"GovernmentResponseIndex"]
+
+
+#plot(gri$GovernmentResponseIndex, gri$StringencyIndex)
+#cor.test(gri$GovernmentResponseIndex, gri$StringencyIndex)
+#dev.off()
 ## Read selected questions
 
 selectedQ <- read.delim("selectedQs.txt", stringsAsFactors = F)
+selectedQ <- selectedQ[selectedQ[,"Question"] %in% qNameMap[,1],]
 selectedQ$qId <- qNameMap[selectedQ[,"Question"],2]
 rownames(selectedQ) <- selectedQ[,"qId"]
+
 
 ## Correlate PRS
 library(heatmap3)
@@ -208,13 +321,13 @@ heatmap3(prsCor, balanceColor = T, margins = c(15,15), scale = "none")
 dev.off()
 
 
-t.test(pheno3[pheno3$array=="Gsa","General.risky.behavior"], pheno3[pheno3$array=="Cyto","General.risky.behavior"])
-boxplot(pheno3[pheno3$array=="Gsa","General.risky.behavior"], pheno3[pheno3$array=="Cyto","General.risky.behavior"])
-dev.off()
+#t.test(pheno3[pheno3$array=="Gsa","General.risky.behavior"], pheno3[pheno3$array=="Cyto","General.risky.behavior"])
+#boxplot(pheno3[pheno3$array=="Gsa","General.risky.behavior"], pheno3[pheno3$array=="Cyto","General.risky.behavior"])
+#dev.off()
 
-t.test(pheno3[pheno3$array=="Gsa","BMI_gwas"], pheno3[pheno3$array=="Cyto","BMI_gwas"])
-boxplot(pheno3[pheno3$array=="Gsa","BMI_gwas"], pheno3[pheno3$array=="Cyto","BMI_gwas"])
-dev.off()
+#t.test(pheno3[pheno3$array=="Gsa","BMI_gwas"], pheno3[pheno3$array=="Cyto","BMI_gwas"])
+#boxplot(pheno3[pheno3$array=="Gsa","BMI_gwas"], pheno3[pheno3$array=="Cyto","BMI_gwas"])
+#dev.off()
 
 
 
@@ -232,17 +345,21 @@ q<-qNameMap["Positive tested cumsum",2]
 q<-qNameMap["kon u zich bijna elke dag moeilijk concentreren of moeilijk beslissingen nemen? (in de afgelopen 7 dagen)",2]
 q<-qNameMap["everC19Pos",2]
 q<-qNameMap["BMI",2]
+q<-qNameMap["ik ben bang dat het fout zal gaan in de samenleving (in de afgelopen 7 dagen)",2]
 zScoreList <- lapply(qLoop, function(q){
   zScores = tryCatch({
     
     qInfo <- selectedQ[q,]
     usedPrs <- colnames(prs)[-1]
-    
+    usedPrs <- "Neuroticism"
+    usedPrs <- "Anxiety.tension"
+    fixedModel <- as.formula(paste(q, "~((gender_recent+age_recent+age2_recent+household_recent+have_childs_at_home_recent+chronic_recent +", paste0(usedPrs, collapse = " + ") ,")*days + days2  ) "))
+    randomModel <- as.formula("~1|PROJECT_PSEUDO_ID")
+        
     resultsPerArray <- lapply(arrayList, function(array){
       
-      d <- vragenLong[!is.na(vragenLong[,q]) & vragenLong$array == array,c("PROJECT_PSEUDO_ID", q,usedPrs,"gender_recent","age_recent","age2_recent","household_recent","have_childs_at_home_recent","chronic_recent", "days", "days2", "array" )]
-      fixedModel <- as.formula(paste(q, "~((gender_recent+age_recent+age2_recent+household_recent+have_childs_at_home_recent+chronic_recent +", paste0(usedPrs, collapse = " + ") ,")*days + days2 ) "))
-      randomModel <- as.formula("~1|PROJECT_PSEUDO_ID")
+      d <- vragenLong[!is.na(vragenLong[,q]) & vragenLong$array == array,c("PROJECT_PSEUDO_ID", q,usedPrs,"gender_recent","age_recent","age2_recent","household_recent","have_childs_at_home_recent","chronic_recent", "days", "days2")]
+
       
       coef <- 0
       
@@ -257,6 +374,7 @@ zScoreList <- lapply(qLoop, function(q){
         print("test3")
         stop("Not implement")
       } else if (qInfo["Type"] == "binomial" & !qInfo["Mixed"]) {
+        print("test4")
         d[,q] <- as.factor(d[,q])
         glmBinomFit <- glm(fixedModel ,family=binomial(link='logit'),data=d)
         coef <- summary(glmBinomFit)$coefficients
@@ -266,74 +384,18 @@ zScoreList <- lapply(qLoop, function(q){
       return(coef)
     })
     
-    str(resultsPerArray)
-    
-    resultsPerArray[["Gsa"]]
-    resultsPerArray[["Cyto"]]
+    #resultsPerArray[["Gsa"]]
+    #resultsPerArray[["Cyto"]]
     
     metaRes <- inverseVarianceMeta(resultsPerArray, "Std.Error", "Value")
-    
+    metaRes
   }, error = function(e){print(q); return(NULL)})
   return(zScores)
 })
 
 
-inverseVarianceMeta <- function(resultsPerArray, seCol, valueCol){
-  x <- as.data.frame(resultsPerArray[[1]][,FALSE])
-  x$sumYDivSe2 <- 0
-  x$sum1DivSe2 <- 0
-  
-  for(array in names(resultsPerArray)){
-    se2 <- resultsPerArray[[array]][,seCol] * resultsPerArray[[array]][,seCol]
-    x$sumYDivSe2 <- x$sumYDivSe2 + (resultsPerArray[[array]][,valueCol]/ se2)
-    x$sum1DivSe2 <- x$sum1DivSe2 + (1/se2)
-  }
-  
-  metaRes <- as.data.frame(resultsPerArray[[1]][,FALSE])
-  metaRes$y <- x$sumYDivSe2/x$sum1DivSe2
-  metaRes$se <- sqrt(1/x$sum1DivSe2)
-  metaRes$z <- metaRes$y/metaRes$se 
-  metaRes$p <- 2*pnorm(-abs(metaRes$z))
-  return(metaRes)
-}
 
 
-
-
-
-
-# Function to predict outcome values given a set of coefficients,
-# input days, input PRSs, the trait corresponding to the input PRS, 
-# and the function family and link function
-predict.meta <- function(days, prs, coefficients, trait, family = gaussian()) {
-  # Define days to the power of 2
-  days2 <- days^2
-  # Calculate the predicted valus on a regular linear scale
-
-  predicted <-
-    coefficients["(Intercept)"] +
-    coefficients["days"] * days + 
-    coefficients["days2"] * days2 + 
-    prs * days * coefficients[paste0(trait,":days")] 
-    +    coefficients[trait] * prs
-  # Return values according to the linear inverse of the link function
-  return(family$linkinv(predicted))
-}
-# Use function
-
-prsTrait = "Anxiety.tension"
-prsTrait = "COVID.19.susceptibility"
-prsRange <- quantile(vragenLong[,prsTrait],probs = seq(0,1,0.5),na.rm=T)
-coef2 = as.matrix(coef)[,"Value"]
-days = seq(1, 307, 1)
-highPrs <- predict.meta(days = days, coefficients = coef2, trait = prsTrait, prs = prsRange[3], family = binomial(link = "logit"))
-medianPrs <- predict.meta(days = days, coefficients = coef2, trait = prsTrait, prs = prsRange[2], family = binomial(link = "logit"))
-lowPrs <- predict.meta(days = days, coefficients = coef2, trait = prsTrait, prs = prsRange[1], family = binomial(link = "logit"))
-
-plot(days, highPrs, ylim = range(lowPrs, medianPrs, highPrs),  col = "red", type = "l", ylab = q, xlab = "Dagen sinds 30 maart 2020", main = paste0("Red is high ", prsTrait, " PRS\nBlue is low PRS"))
-points(days, medianPrs, col = "green", type = "l")
-points(days, lowPrs, col = "blue", type = "l")
-dev.off()
 
 
 
@@ -453,6 +515,8 @@ glmBinomFit <- glm(fixedModel ,family=binomial(link='logit'),data=d)
 summary(glmBinomFit)
 
 
+prsTrait = "Major.depressive.disorder.in.trauma.exposed.individuals"
+prsTrait = "COVID.19.susceptibility"
 prsTrait = "Anxiety.tension"
 prsRange <- quantile(prs[,prsTrait],probs = seq(0,1,0.1))
 
@@ -461,37 +525,38 @@ dummy$days <- 1:307
 dummy$days2 <- dummy$days * dummy$days
 for(prsCol in colnames(prs)[-1]){
   dummy[,prsCol] <- mean(prs[,prsCol])
-  dummy[,prsCol] <- 0
+  #dummy[,prsCol] <- 0
 }
 dummy[,"age_recent"] <- mean(pheno3$age_recent)
-dummy[,"age_recent"] <- 0
+#dummy[,"age_recent"] <- 0
 dummy[,"age2_recent"] <- dummy[,"age_recent"] * dummy[,"age_recent"]
-dummy[,"household_recent"] <- levels(dummy[,"household_recent"])[1]
-dummy[,"have_childs_at_home_recent"] <- levels(dummy[,"have_childs_at_home_recent"])[1]
-dummy[,"gender_recent"] <- levels(dummy[,"gender_recent"])[1]
-dummy[,"chronic_recent"] <- levels(dummy[,"chronic_recent"])[1]
-
+dummy[,"household_recent"] <- factor(levels(dummy[,"household_recent"])[1], levels = levels(dummy[,"household_recent"]))
+dummy[,"have_childs_at_home_recent"] <- factor(levels(dummy[,"have_childs_at_home_recent"])[1], levels = levels(dummy[,"have_childs_at_home_recent"]))
+dummy[,"gender_recent"] <- factor(levels(dummy[,"gender_recent"])[1], levels = levels(dummy[,"gender_recent"]))
+dummy[,"chronic_recent"] <- factor(levels(dummy[,"chronic_recent"])[1], levels = levels(dummy[,"chronic_recent"]))
 
 #test <- predict(glmBinomFit, type = "terms", newdata = dummy)
 #test[,"Neuroticism:days"]
 
+coef=as.matrix(metaRes)[,"y"]
 
-dummy[,prsTrait] <- prsRange[1]
-predictLow <- predict.glm(glmBinomFit, dummy, type = "response")
+dummy[,prsTrait] <- prsRange[10]
+highPrs <- predict_meta(df = dummy, coefficients = coef, formula = fixedModel, family = binomial(link = "logit"))
+dummy[,prsTrait] <- prsRange[6]
+medianPrs <- predict_meta(df = dummy, coefficients = coef, formula = fixedModel, family = binomial(link = "logit"))
 dummy[,prsTrait] <- prsRange[2]
-predictMedium <- predict(glmBinomFit, dummy, type = "response")
-dummy[,prsTrait] <- prsRange[3]
-predictHigh <- predict(glmBinomFit, dummy, type = "response")
+lowPrs <- predict_meta(df = dummy, coefficients = coef, formula = fixedModel, family = binomial(link = "logit"))
+
 
 
 plot.new()
-plot.window(xlim = range(dummy$days), ylim = range(predictLow, predictHigh))
+plot.window(xlim = range(dummy$days), ylim = range(lowPrs, medianPrs, highPrs))
 axis(side = 1)
 axis(side = 2)
 title(xlab = "days", ylab = "C19 pos")
-points(predictLow, col = "blue", type = "l")
-points(predictMedium, col = "green", type = "l")
-points(predictHigh, col = "red", type = "l")
+points(lowPrs, col = "blue", type = "l")
+points(medianPrs, col = "green", type = "l")
+points(highPrs, col = "red", type = "l")
 dev.off()
 
 
